@@ -20,10 +20,15 @@ from rsptx.db.models import (
     QuestionGrade,
     QuestionValidator,
     SelectedQuestion,
-    runestone_component_dict,
 )
 from rsptx.lti1p3.core import attempt_lti1p3_score_update
 from rsptx.logging import rslogger
+from rsptx.grading_helpers.answer_tables import (  # noqa: F401  (re-exported)
+    CODE_TABLE_TYPES,
+    QTYPE_TO_TABLE,
+    UNITTEST_TABLE,
+    answer_table_for as _answer_table_for,
+)
 from rsptx.grading_helpers.scoring import (
     score_answer_values,
     score_peer_values,
@@ -31,36 +36,7 @@ from rsptx.grading_helpers.scoring import (
 )
 
 
-QTYPE_TO_TABLE = {
-    "mchoice": "mchoice_answers",
-    "fillintheblank": "fitb_answers",
-    "parsonsprob": "parsons_answers",
-    "activecode": "unittest_answers",
-    "actex": "unittest_answers",
-    "shortanswer": "shortanswer_answers",
-    "clickablearea": "clickablearea_answers",
-    "dragndrop": "dragndrop_answers",
-    "codelens": "codelens_answers",
-    "matching": "matching_answers",
-    "webwork": "webwork_answers",
-    "hparsons": "microparsons_answers",
-    "microparsons": "microparsons_answers",
-    "splice": "splice_answers",
-}
-
-UNITTEST_TABLE = "unittest_answers"
-
 MANUAL_COMMENT = "autograded"
-
-
-def _answer_table_for(question_type: str):
-    table_name = QTYPE_TO_TABLE.get(question_type)
-    if not table_name:
-        return None, None
-    rcd = runestone_component_dict.get(table_name)
-    if not rcd:
-        return None, None
-    return rcd.model, table_name
 
 
 class RegradeOptions(BaseModel):
@@ -122,6 +98,11 @@ async def _fetch_answer_rows(tbl, div_id: str, course_name: str, sid: str):
 
 
 def _effective_deadline(assignment: AssignmentValidator, accommodation):
+    """Return the assignment deadline as naive UTC, with any accommodation applied.
+
+    ``Assignment.duedate`` is stored as naive UTC, the same as the answer table
+    timestamps it gets compared against, so no timezone conversion belongs here.
+    """
     deadline = assignment.duedate
     if deadline is None:
         return None
@@ -313,13 +294,23 @@ def apply_threshold_score(
 
 
 async def _recompute_total_for_user(
-    user: AuthUserValidator, assignment: AssignmentValidator
+    user: AuthUserValidator, assignment: AssignmentValidator, course_name: str
 ) -> None:
+    """Roll the student's ``question_grades`` up into their ``grades`` row.
+
+    ``course_name`` is the course the assignment belongs to, and must be passed
+    in rather than read off ``user.course_name``. ``auth_user.course_name`` is
+    whichever course the student currently has *active*, which is not
+    necessarily the one being graded: the roster comes from ``user_courses``, so
+    it includes students who have since moved on to another course. Scoring off
+    the active course made ``fetch_assignment_scores`` match no ``question_grades``
+    rows at all and silently rolled the total up to 0.
+    """
     grade = await fetch_grade(user.id, assignment.id)
     if grade and grade.manual_total:
         return
 
-    res = await fetch_assignment_scores(assignment.id, user.course_name, user.username)
+    res = await fetch_assignment_scores(assignment.id, course_name, user.username)
     total = 0
     for row in res:
         total += row.score or 0
@@ -332,7 +323,6 @@ async def _recompute_total_for_user(
     else:
         new_grade = GradeValidator(
             auth_user=user.id,
-            course_name=user.course_name,
             assignment=assignment.id,
             score=total,
             manual_total=False,
@@ -364,7 +354,7 @@ async def recompute_totals_for(
     processed = 0
     for user in targets:
         try:
-            await _recompute_total_for_user(user, assignment)
+            await _recompute_total_for_user(user, assignment, course.course_name)
             processed += 1
         except Exception as e:  # pragma: no cover - defensive
             rslogger.error(f"recompute totals failed sid={user.username}: {e}")
@@ -422,7 +412,9 @@ async def regrade_batch(
             user = user_map.get(sid)
             if user is not None:
                 try:
-                    await _recompute_total_for_user(user, assignment)
+                    await _recompute_total_for_user(
+                        user, assignment, course.course_name
+                    )
                 except Exception as e:  # pragma: no cover - defensive
                     rslogger.error(f"recompute totals failed sid={sid}: {e}")
 

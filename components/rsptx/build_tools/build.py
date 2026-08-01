@@ -7,6 +7,7 @@
 # Imports
 # -------
 import locale
+from pathlib import Path
 import os
 import subprocess
 import sys
@@ -95,7 +96,9 @@ def cli(config, verbose, all, core, service, clean, skip_pre, skip_tests):
     if clean:
         clean_all()
 
-    if not service and not all:
+    if core:
+        click.echo("Building core services")
+    if not service and not all and not core:
         click.echo("No services specified, building core services")
         core = True
 
@@ -1015,7 +1018,43 @@ def test(config):
             console.print(ret.stderr.decode(stdout_err_encoding))
         exit(1)
 
+    _run_assignment_builder_tests()
+
     console.print("All checks passed", style="green")
+
+
+# The React assignment builder has its own test suite. It is not covered by
+# pytest, so run it here too -- a broken build surfaces at build time rather
+# than after deploy.
+ASSIGNMENT_BUILDER_DIR = Path("bases/rsptx/assignment_server_api/assignment_builder")
+
+
+def _run_assignment_builder_tests():
+    """Run the assignment builder vitest suite, if its deps are installed."""
+    if not ASSIGNMENT_BUILDER_DIR.exists():
+        return
+
+    if not (ASSIGNMENT_BUILDER_DIR / "node_modules").exists():
+        console.print(
+            f"Skipping assignment builder tests: no node_modules in "
+            f"{ASSIGNMENT_BUILDER_DIR}. Run `npm install` there to enable them.",
+            style="bold yellow",
+        )
+        return
+
+    console.print("Running vitest in assignment_builder...", style="bold")
+    ret = subprocess.run(
+        ["npx", "vitest", "run", "--coverage.enabled=false"],
+        cwd=ASSIGNMENT_BUILDER_DIR,
+        capture_output=True,
+    )
+    if ret.returncode != 0:
+        console.print("Assignment builder tests failed", style="bold red")
+        if ret.stdout:
+            console.print(ret.stdout.decode(stdout_err_encoding))
+        if ret.stderr:
+            console.print(ret.stderr.decode(stdout_err_encoding))
+        exit(1)
 
 
 # Bake

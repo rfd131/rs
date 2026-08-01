@@ -31,7 +31,8 @@ export async function renderRunestoneComponent(
   }
 
   // figure out what kind of component we are dealing with
-  let componentKind = previewRef.current.querySelector("[data-component]").dataset.component;
+  // Older webwork markup has no [data-component] at all, so this can be null.
+  let componentKind = previewRef.current.querySelector("[data-component]")?.dataset.component;
   // webwork problems do not have a data-component attribute so we have to try to figure it out.
   //
 
@@ -77,7 +78,11 @@ export async function renderRunestoneComponent(
         // Grab the preamble if it exists.
         // add it to opt so that it can be used by the component factory
         // This is used for mathjax processing of the preview.
-        let preamble = document.querySelector("div.hidden-content.process-math");
+        // The carrier div is tex2jax_ignore so MathJax leaves the macro source
+        // byte-for-byte alone; the second selector is the pre-#1248 markup.
+        let preamble =
+          document.getElementById("latex_preamble") ||
+          document.querySelector("div.hidden-content.process-math");
         if (preamble) {
           preamble = preamble.innerHTML;
           opt.preamble = preamble;

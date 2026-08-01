@@ -43,8 +43,6 @@ from rsptx.db.models import Library, LibraryValidator
 from rsptx.db.crud import update_source_code_sync
 from rsptx.response_helpers.core import canonical_utcnow
 
-rslogger.setLevel("WARNING")
-
 
 # Return the synchronous database URL for the current SERVER_CONFIG.
 #
@@ -193,32 +191,50 @@ def _build_ptx_book(config, gen, manifest, course, click=click, target="runeston
         )
         # ensure we get a clean file for each build
         with open(log_path, "w") as olfile:
-            olfile.write(f"Build started at {datetime.datetime.utcnow()}\n")
+            olfile.write(f"Build started at {datetime.datetime.now()}\n")
             olfile.write(f"Target: {target}\n")
 
+        # PreTeXt only sets a level on ptxlogger from its own CLI (the -v option),
+        # so when we drive it as a library the logger is NOTSET and falls back to
+        # the root logger's WARNING -- silently dropping every log.info() the
+        # build emits.  Set the level ourselves so the handler below sees them.
         logger = logging.getLogger("ptxlogger")
+        prior_level = logger.level
+        logger.setLevel(os.environ.get("PTX_LOG_LEVEL", "INFO").upper())
         string_io_handler = StringIOHandler()
+        # Match PreTeXt's own file format so the level names land in the log --
+        # the build result below is decided by scanning for ERROR/FATAL.
+        string_io_handler.setFormatter(
+            logging.Formatter("{levelname:<8}: {message}", style="{")
+        )
         logger.addHandler(string_io_handler)
         if hasattr(click, "worker"):
             click.add_logger(logger)
-        # clean out the output directory
+        try:
+            # clean out the output directory
 
-        if rs.output_dir_abspath().exists():
-            shutil.rmtree(rs.output_dir_abspath())
+            if rs.output_dir_abspath().exists():
+                shutil.rmtree(rs.output_dir_abspath())
 
-        click.echo("Building the book")
-        if gen:
-            click.echo("Generating assets")
-            rs.generate_assets(only_changed=False, skip_cache=True)
+            click.echo("Building the book")
+            if gen:
+                click.echo("Generating assets")
+                rs.generate_assets(only_changed=False, skip_cache=True)
 
-        rs.build()  # build the book, generating assets as needed
-        if not log_path.parent.exists():
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-        click.echo(f"Writing log to {log_path}")
-        log_string = string_io_handler.getvalue()
-        with open(log_path, "a") as olfile:
-            olfile.write(log_string)
-
+            rs.build()  # build the book, generating assets as needed
+        finally:
+            # Books are built one after another in the same process, so leaving
+            # the handler attached would make later builds feed dead buffers.
+            logger.removeHandler(string_io_handler)
+            logger.setLevel(prior_level)
+            # Write the log here rather than after the build so that a build
+            # that raises still leaves behind everything it logged.
+            click.echo(f"Writing log to {log_path}")
+            log_string = string_io_handler.getvalue()
+            with open(log_path, "a") as olfile:
+                olfile.write(f"Build completed at {datetime.datetime.now()}\n")
+                olfile.write(log_string)
+                olfile.write("end of captured log\n")
         book_path = (
             Path(os.environ.get("BOOK_PATH"))
             / rs.output_dir
@@ -701,6 +717,9 @@ def _process_appendices(sess, db_context, course_name, manifest_path):
 
 def _process_single_chapter(sess, db_context, chapter, chap_counter, course_name):
     """Process a single chapter and return its database ID."""
+    rslogger.info(
+        f"Processing chapter {chapter.find('./id').text if chapter.find('./id') is not None else 'Unknown'}"
+    )
     cnum_text = chapter.find("./number").text
     if not cnum_text:
         cnum = chap_counter
@@ -762,6 +781,9 @@ def _process_subchapters(sess, db_context, chapter, chapid, course_name):
 def _process_single_subchapter(
     sess, db_context, chapter, subchapter, chapid, subchap_counter, course_name
 ):
+    rslogger.info(
+        f"Processing subchapter {subchapter.find('./id').text if subchapter.find('./id') is not None else 'Unknown'}"
+    )
     """Process a single subchapter and its contents."""
     scnum_text = subchapter.find("./number").text
     if scnum_text:
@@ -908,7 +930,9 @@ def _process_single_timed_assignment(
 ):
     """Process a timed assignment subchapter."""
     subchapter = subchapter.find("./ul[@data-component='timedAssessment']")
-    rslogger.info("Processing timed assignment subchapter")
+    rslogger.info(
+        f"Processing timed assignment subchapter {subchapter.find('./id').text if subchapter.find('./id') is not None else 'Unknown'}"
+    )
     titletext = subchapter.find("./title")
     if titletext is not None:
         titletext = titletext.text.strip()
@@ -1041,6 +1065,12 @@ def _process_single_question(
     sess, db_context, chapter, subchapter, question, course_name
 ):
     """Process a single question element."""
+    try:
+        rslogger.info(f"Processing question {question.find('./label').text}")
+    except Exception:
+        rslogger.error(
+            f"Error processing question: {ET.tostring(question).decode('utf8')}"
+        )
     # Extract question content
     dbtext = " ".join(
         [ET.tostring(y).decode("utf8") for y in question.findall("./htmlsrc/*")]
@@ -1096,7 +1126,6 @@ def _process_single_question(
         author=db_context["author"],
         owner=db_context["owner"],
     )
-
     # Insert or update question
     namekey = old_ww_id if old_ww_id else idchild
     _upsert_question(sess, db_context, namekey, valudict, course_name)

@@ -12,10 +12,12 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
 )
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import csv
+import re
 from io import StringIO
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 # Local application imports
 # -------------------------
@@ -60,7 +62,8 @@ from rsptx.db.crud import (
 )
 from rsptx.auth.session import auth_manager
 from rsptx.auth.email import send_welcome_email
-from rsptx.templates import template_folder
+from rsptx.templates import get_shared_templates
+from rsptx.validation.fields import clean_text, validate_text_field
 from rsptx.configuration import settings
 from rsptx.endpoint_validators import with_course, instructor_role_required
 from rsptx.logging import rslogger
@@ -81,6 +84,11 @@ router = APIRouter(
     prefix="/instructor",
     tags=["instructor"],
 )
+
+# A course name becomes part of a URL path, so it is restricted to the same
+# characters rsmanage enforces. A name with spaces used to be accepted here and
+# produced a course whose pages would not render.
+COURSE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 rslogger.info("Registering instructor API routes")
 
@@ -117,7 +125,7 @@ async def get_instructor_menu(
     Display the main instructor menu dashboard.
     """
     rslogger.info(f"Rendering instructor menu for course: {course.course_name}")
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
     context = {
         "course": course,
         "user": user,
@@ -142,7 +150,7 @@ async def get_manage_students(
     """
     Display the student management interface.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     # Get all students in the course
     students = {}  # This would normally be populated from the database
@@ -173,7 +181,7 @@ async def get_copy_assignments(
     """
     Display the copy assignments interface.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     # Get instructor's available courses for copying from
     instructor_course_relationships = await fetch_instructor_courses(user.id)
@@ -393,7 +401,7 @@ async def get_course_settings(
     """
     Display the course settings interface.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     # Get all course attributes
     course_attrs = await fetch_all_course_attributes(course.id)
@@ -447,7 +455,7 @@ async def get_lti_config(
     management (the LTI 1.3 pieces are configured elsewhere and are only surfaced
     here for informational purposes and to allow removing an association).
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     lti_key = await fetch_lti1p1_config(course.id)
     course_attrs = await fetch_all_course_attributes(course.id)
@@ -528,7 +536,7 @@ async def get_assessment_reset(
     """
     Display the assessment reset interface.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     # Get all students in the course
     students = await fetch_users_for_course(course.course_name)
@@ -625,7 +633,7 @@ async def get_course_delete(
         rslogger.info(
             f"Rendering course deletion page for course: {course.course_name}"
         )
-        templates = Jinja2Templates(directory=template_folder)
+        templates = get_shared_templates()
         context = {
             "course": course,
             "student_count": student_count,
@@ -720,7 +728,7 @@ async def get_add_instructor(
     """
     Render the Add Instructor page.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
     context = {
         "course": course,
         "user": user,
@@ -821,7 +829,7 @@ async def remove_student(
     Remove one or more students from the current course.
     Expects form data with student_id (can be a single value or a list).
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
 
     try:
         form = await request.form()
@@ -946,6 +954,13 @@ async def enroll_students(
     enrolled = 0
     for row in reader:
         rslogger.info(f"Processing row: {row}")
+        # Spreadsheet exports routinely carry stray whitespace -- most painfully a
+        # newline inside a cell, which used to be stored verbatim and then break
+        # eBookConfig (and therefore every component) on the student's pages.
+        row = [field.strip() for field in row]
+        if not any(row):
+            # A blank line, e.g. the trailing newline at the end of the file.
+            continue
         if len(row) < 6:
             results.append(
                 {
@@ -1055,7 +1070,7 @@ async def enroll_students(
         mess = f"Enrollment completed with {enrolled} successful enrollments and {failed} failures."
     else:
         mess = f"All {enrolled} students enrolled successfully."
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
     return templates.TemplateResponse(
         "admin/instructor/enroll_results.html",
         {
@@ -1162,6 +1177,24 @@ async def copy_assignment(
         )
 
 
+def _term_start_utc(term_start_date, timezone: Optional[str]) -> datetime.datetime:
+    """Midnight local time on the first day of term, expressed as naive UTC.
+
+    ``term_start_date`` is a bare date, so on its own it has no timezone. Due
+    dates are stored as naive UTC, so the term start has to be anchored in the
+    course timezone before the two can be subtracted -- otherwise the offset
+    from the start of term is wrong by the course's UTC offset. A course with
+    no timezone is treated as UTC, matching the ``duedate`` migration.
+    """
+    midnight = datetime.datetime.combine(term_start_date, datetime.time())
+    tz = ZoneInfo(timezone) if timezone else datetime.timezone.utc
+    return (
+        midnight.replace(tzinfo=tz)
+        .astimezone(datetime.timezone.utc)
+        .replace(tzinfo=None)
+    )
+
+
 async def _copy_one_assignment(
     source_course_name: str, old_assignment_id: int, target_course
 ) -> str:
@@ -1179,15 +1212,16 @@ async def _copy_one_assignment(
         source_course = await fetch_course(source_course_name)
         old_assignment = await fetch_one_assignment(old_assignment_id)
 
-        # Calculate due date adjustment based on course start dates
+        # Calculate due date adjustment based on course start dates. Both term
+        # starts are anchored in their own course timezone so the offset from
+        # the start of term is preserved as local wall clock time, even when
+        # the two terms fall on opposite sides of a DST change.
         if source_course.term_start_date and target_course.term_start_date:
-            due_delta = old_assignment.duedate - datetime.datetime.combine(
-                source_course.term_start_date, datetime.time()
+            due_delta = old_assignment.duedate - _term_start_utc(
+                source_course.term_start_date, source_course.timezone
             )
             due_date = (
-                datetime.datetime.combine(
-                    target_course.term_start_date, datetime.time()
-                )
+                _term_start_utc(target_course.term_start_date, target_course.timezone)
                 + due_delta
             )
         else:
@@ -1313,7 +1347,7 @@ async def get_create_course_page(request: Request, user=Depends(auth_manager)):
     """
     Display the course designer form for instructors.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
     # Fetch real course list from the library table
     course = user.course_name
 
@@ -1369,9 +1403,31 @@ async def post_create_course_page(
     """
     Process the course designer form submission.
     """
-    templates = Jinja2Templates(directory=template_folder)
+    templates = get_shared_templates()
     # Prepare course data for validator
     try:
+        # Validate the free-text fields before they reach the database. Without
+        # this, an over-long institution or course name failed with a raw column
+        # overflow, and a course name containing spaces was accepted but produced
+        # a course whose pages would not render.
+        institution = clean_text(institution)
+        projectname = clean_text(projectname)
+        field_errors = [
+            err
+            for err in (
+                validate_text_field(institution, "Institution"),
+                validate_text_field(projectname, "Course name"),
+            )
+            if err
+        ]
+        if projectname and not COURSE_NAME_RE.match(projectname):
+            field_errors.append(
+                "Course name may only contain letters, digits, hyphens, and "
+                "underscores (no spaces)."
+            )
+        if field_errors:
+            raise ValueError(" ".join(field_errors))
+
         course_data = {
             "course_name": projectname,
             "term_start_date": _parse_start_date(startdate),

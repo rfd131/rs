@@ -316,9 +316,69 @@ function addReadingList() {
 }
 
 
-class PageProgressBar {
+/**
+ * Build the activity dictionary for the progress bar by scanning the page.
+ *
+ * This is the fallback used when the server did not send activity counts --
+ * i.e. when nobody is logged in and the page is being browsed.  The keys are
+ * the div_ids that ``updateProgress`` increments, so they have to be the ids of
+ * the elements carrying ``data-component``.  Those are not always the first
+ * child of the ``.runestone`` wrapper: PreTeXt, for instance, emits an
+ * ``exercise-statement`` div ahead of the component for multiple choice
+ * questions.  Keying off the first child in that case gave every such question
+ * on the page the same empty key, so eight exercises counted as one.
+ *
+ * @param {ParentNode} root - where to look; defaults to the whole document.
+ * @returns {Object} activity ids mapped to 0, plus the ``page`` pseudo-activity.
+ */
+// Navigation and reference pages rather than content: they carry no activities,
+// so they get no progress bar, no completion button and no highlighting. Keep
+// this as the single list -- it used to be spelled out separately in
+// user-highlights.js and the sphinx progress template, and the copies had
+// drifted apart (genindex.html was missing here, which left a progress bar on
+// the Book Index page).
+export const NON_CONTENT_PAGES = [
+    "index.html",
+    "genindex.html",
+    "toctree.html",
+    "toc.html",
+    "navhelp.html",
+    "assignments.html",
+    "Exercises.html",
+    "search.html",
+];
+
+/** True when pathname names one of the NON_CONTENT_PAGES. */
+export function isNonContentPage(pathname = window.location.pathname) {
+    let page = pathname.split("/").pop().toLowerCase();
+    return NON_CONTENT_PAGES.some((p) => p.toLowerCase() === page);
+}
+
+export function countActivitiesInPage(root = document) {
+    let activities = { page: 0 };
+    root.querySelectorAll(".runestone").forEach(function (e, index) {
+        // A component may be the wrapper itself or somewhere inside it. Nested
+        // parts of a component (mchoice answers, feedback) also carry
+        // data-component, but querySelector returns the outermost match first.
+        let component = e.matches("[data-component]")
+            ? e
+            : e.querySelector("[data-component]");
+        let id = component?.id || e.firstElementChild?.id;
+        // Without an id we cannot match this activity to a completion event,
+        // but it is still one activity: give it a key of its own so it is not
+        // folded together with every other unidentified one on the page.
+        activities[id || `unidentified-activity-${index}`] = 0;
+    });
+    return activities;
+}
+
+export class PageProgressBar {
     constructor(actDict) {
         this.possible = 0;
+        // The page itself counts as one item and is attempted as soon as it is
+        // opened. That is what lets a page with no activities on it still be
+        // completed. It is deliberately kept out of the numbers shown to the
+        // reader -- see activitiesAttempted/activitiesPossible below.
         this.total = 1;
         if (actDict && "assignment_spec" in actDict) {
             this.assignment_spec = actDict.assignment_spec;
@@ -327,19 +387,17 @@ class PageProgressBar {
         if (actDict && Object.keys(actDict).length > 0) {
             this.activities = actDict;
         } else {
-            let activities = { page: 0 };
-            document.querySelectorAll(".runestone").forEach(function (e) {
-                activities[e.firstElementChild.id] = 0;
-            });
-            this.activities = activities;
+            this.activities = countActivitiesInPage();
+        }
+        // The server builds its dict from the question table, so it has no
+        // entry for the page, while countActivitiesInPage() adds one. Normalise
+        // it so logged in and logged out readers get the same counts.
+        if (!("page" in this.activities)) {
+            this.activities.page = 0;
         }
         this.calculateProgress();
-        // Hide the progress bar on the index page.
-        if (
-            window.location.pathname.match(
-                /.*\/(index.html|toctree.html|Exercises.html|search.html)$/i,
-            )
-        ) {
+        // Hide the progress bar on navigation pages, which have no activities.
+        if (isNonContentPage()) {
             const scprogresscontainer = document.getElementById(
                 "scprogresscontainer",
             );
@@ -359,12 +417,27 @@ class PageProgressBar {
         }
     }
 
+    // The counts shown beside the bar describe "activities on this page", and
+    // the page entry is not one of them -- reporting it made a freshly opened
+    // page read "1 of 4" when the reader could only see three activities.
+    // Progress percentage still uses total/possible so that opening the page
+    // counts toward completion.
+    get activitiesAttempted() {
+        return Math.max(this.total - 1, 0);
+    }
+
+    get activitiesPossible() {
+        return Math.max(this.possible - 1, 0);
+    }
+
     renderProgress() {
         let value = 0;
         const scprogresstotal = document.getElementById("scprogresstotal");
-        if (scprogresstotal) scprogresstotal.textContent = this.total;
+        if (scprogresstotal)
+            scprogresstotal.textContent = this.activitiesAttempted;
         const scprogressposs = document.getElementById("scprogressposs");
-        if (scprogressposs) scprogressposs.textContent = this.possible;
+        if (scprogressposs)
+            scprogressposs.textContent = this.activitiesPossible;
         try {
             value = (100 * this.total) / this.possible;
         } catch (e) {
@@ -391,11 +464,22 @@ class PageProgressBar {
             // This handles the case where there are no activities on the page or
             //  where the user completed activities on the assignment page and now
             //  is viewing the reading page.
-            let completeActivities = this.total; // subtract 1 for the page reading which is in total but not an activity
-            let requiredActivities =
-                this.assignment_spec.activities_required || 1;
-            if (this.assignment_spec.activities_required === null) {
-                this.assignment_spec.activities_required = this.possible; // if activities_required is null, then there are none on the page
+            // activities_required counts activities the reader completes, so
+            // compare against activitiesAttempted rather than total -- total
+            // includes the page itself, which used to send the reading score
+            // one activity early.
+            let completeActivities = this.activitiesAttempted;
+            let requiredActivities = this.assignment_spec.activities_required;
+            if (
+                requiredActivities === null ||
+                requiredActivities === undefined
+            ) {
+                // Nothing specific is required on this page, so opening it is
+                // enough. Record how many activities are here for the check in
+                // updateProgress().
+                requiredActivities = 0;
+                this.assignment_spec.activities_required =
+                    this.activitiesPossible;
             }
             if (completeActivities >= requiredActivities) {
                 this.sendCompletedReadingScore().then(() => {
@@ -427,9 +511,11 @@ class PageProgressBar {
             this.total++;
             let val = (100 * this.total) / this.possible;
             const scprogresstotal2 = document.getElementById("scprogresstotal");
-            if (scprogresstotal2) scprogresstotal2.textContent = this.total;
+            if (scprogresstotal2)
+                scprogresstotal2.textContent = this.activitiesAttempted;
             const scprogressposs2 = document.getElementById("scprogressposs");
-            if (scprogressposs2) scprogressposs2.textContent = this.possible;
+            if (scprogressposs2)
+                scprogressposs2.textContent = this.activitiesPossible;
             let subchapterprogress2 =
                 document.getElementById("subchapterprogress");
             if (
@@ -441,7 +527,8 @@ class PageProgressBar {
             if (
                 this.assignment_spec &&
                 this.assignment_spec.activities_required !== null &&
-                this.total >= this.assignment_spec.activities_required
+                this.activitiesAttempted >=
+                    this.assignment_spec.activities_required
             ) {
                 console.log("Required activities completed");
                 this.sendCompletedReadingScore().then(() => {
@@ -912,7 +999,9 @@ function shouldShowStudyCluesWidget() {
         "Test-py4e-int",
         "virginiatech_py4e-int_spring26",
         "umsi101_fall26",
-        "csci150-26sp-michael",
+        "csawesome2_studyclues_test",
+        "httlacs_studyclues_test",
+        "py4e_studyclues_test",
     ];
     const host = window.location.hostname;
 
@@ -1240,20 +1329,19 @@ window.addEventListener("DOMContentLoaded", function (event) {
                 "groups_3"
             ),
         );
+        // On runestone.academy the author server is its own host, so this has to
+        // be absolute. Single-proxy deployments set authorServerUrl to /author.
+        let authorUrl =
+            (eBookConfig.authorServerUrl ||
+                "https://author.runestone.academy/author") + "/";
         if (eBookConfig.isAuthor) {
             menuContentArea.appendChild(
-                makeLink(
-                    "https://author.runestone.academy/author/",
-                    "Author Dashboard",
-                ),
+                makeLink(authorUrl, "Author Dashboard"),
             );
         }
         if (eBookConfig.isEditor) {
             menuContentArea.appendChild(
-                makeLink(
-                    "https://author.runestone.academy/author/",
-                    "Editor Dashboard",
-                ),
+                makeLink(authorUrl, "Editor Dashboard"),
             );
         }
         menuContentArea.appendChild(
