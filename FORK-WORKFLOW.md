@@ -50,3 +50,34 @@ upstream's version of those hunks so we converge with them.
 git log --oneline --first-parent main..biocalc   # our merges on top of upstream
 git diff main...biocalc --stat                    # net content difference
 ```
+
+## Pending checks
+
+Open items that must clear before the next book release. Delete each entry once
+it is done.
+
+### Run the test suite against the 2026-08-01 upstream merge
+
+`biocalc` merged 50 upstream commits (`e4974e1b` → `75faaeab`). The merge was
+textually clean with zero conflicts, but **no tests were run**. It changed 5,936
+lines across 126 files, including timezone/due-date handling, session-cookie
+auth, and grading helpers.
+
+Must pass before pinning this SHA in `runestone.env` for a book release.
+
+### Apply the duedate-to-UTC migration before the next CourseHub deploy
+
+That same merge pulled in `migrations/versions/c4e8a1f7b2d9_duedate_to_utc.py`
+("Store assignment due dates in UTC", upstream `c75e2b6c`). It is
+**data-transforming, not schema-only** — it rewrites existing assignment due
+dates, so rolling it back is not trivial.
+
+```bash
+# snapshot the database FIRST, then:
+alembic upgrade head
+```
+
+Afterwards, spot-check that gradebook due dates render correctly for the biocalc
+course. Upstream also added `staticAssets/js/localize-times.js` and
+`common/localize_times.html`, so due dates are now rendered client-side in local
+time.
